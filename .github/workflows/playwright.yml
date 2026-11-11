@@ -1,0 +1,77 @@
+# Runs the framework's checks and tests on GitHub: on every pull request, on every push to main, and on
+# demand (Actions -> Playwright tests -> Run workflow). Set up once in the repository's settings:
+#   Settings -> Secrets and variables -> Actions -> Secrets:    RA_ACCOUNTS = the test logins as JSON, e.g.
+#       {"Admin": {"username": "qa-admin@example.com", "password": "..."}}
+#   Settings -> Secrets and variables -> Actions -> Variables:  TEST_ENV = the environment to test (default qa)
+#       BROWSERS = local browsers, e.g. chromium,firefox,webkit (default chromium)
+#   Cloud grid (optional): variable EXECUTION_MODE = cloud (and LT_BROWSER, LT_PLATFORM), secrets LT_USERNAME and
+#       LT_ACCESS_KEY. A site that is not on the internet also needs a LambdaTest tunnel step (see README).
+# Use a test or staging site: the tests really click, submit and order.
+name: Playwright tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment (a file name in config/environments, without .env.json)
+        required: false
+      browsers:
+        description: Browsers, comma separated (chromium, firefox, webkit, mobile-chrome, mobile-safari)
+        required: false
+
+concurrency:
+  group: playwright-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TEST_ENV: ${{ inputs.environment || vars.TEST_ENV || 'qa' }}
+      RA_ACCOUNTS: ${{ secrets.RA_ACCOUNTS }}
+      BROWSERS: ${{ inputs.browsers || vars.BROWSERS || 'chromium' }}
+      EXECUTION_MODE: ${{ vars.EXECUTION_MODE || 'local' }}
+      LT_BROWSER: ${{ vars.LT_BROWSER }}
+      LT_PLATFORM: ${{ vars.LT_PLATFORM }}
+      LT_USERNAME: ${{ secrets.LT_USERNAME }}
+      LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install (versions pinned in package-lock.json)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install browsers
+        if: ${{ env.EXECUTION_MODE != 'cloud' }}
+        # The mobile projects emulate a phone in Chromium (mobile-chrome) or WebKit (mobile-safari).
+        run: npx playwright install --with-deps $(echo "$BROWSERS" | tr -cd 'a-z,-' | sed 's/mobile-chrome/chromium/g; s/mobile-safari/webkit/g; s/,/ /g')
+      - name: TypeScript
+        run: npm run typecheck
+      - name: Lint and conventions
+        run: npm run lint
+      - name: Tests on ${{ env.TEST_ENV }}
+        run: npx playwright test
+      - name: Quarantined tests (reported, never blocking)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          RUN_QUARANTINE: '1'
+        run: npx playwright test --grep @quarantine --pass-with-no-tests --output test-results/quarantine --reporter list
+      - name: Keep the report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: playwright-report-${{ env.TEST_ENV }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
